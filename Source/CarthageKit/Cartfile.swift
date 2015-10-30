@@ -35,8 +35,9 @@ public struct Cartfile {
 		var result: Result<(), CarthageError> = .success(())
 
 		let commentIndicator = "#"
-		(string as NSString).enumerateLinesUsingBlock { (line, stop) in
+		string.enumerateLines { (line, stop) in
 			let scanner = NSScanner(string: line)
+			
 			if scanner.scanString(commentIndicator, intoString: nil) {
 				// Skip the rest of the line.
 				return
@@ -47,13 +48,13 @@ public struct Cartfile {
 				return
 			}
 
-			switch (Dependency<VersionSpecifier>.fromScanner(scanner)) {
+			switch Dependency<VersionSpecifier>.fromScanner(scanner) {
 			case let .Success(dep):
 				cartfile.dependencies.append(dep.value)
 
 			case let .Failure(error):
 				result = .failure(error.value)
-				stop.memory = true
+				stop = true
 			}
 
 			if scanner.scanString(commentIndicator, intoString: nil) {
@@ -63,7 +64,7 @@ public struct Cartfile {
 
 			if !scanner.atEnd {
 				result = .failure(CarthageError.ParseError(description: "unexpected trailing characters in line: \(line)"))
-				stop.memory = true
+				stop = true
 			}
 		}
 
@@ -88,7 +89,7 @@ public struct Cartfile {
 
 extension Cartfile: Printable {
 	public var description: String {
-		return "\(dependencies)"
+		return dependencies.description
 	}
 }
 
@@ -142,7 +143,7 @@ public struct ResolvedCartfile {
 
 		let scanner = NSScanner(string: string)
 		scannerLoop: while !scanner.atEnd {
-			switch (Dependency<PinnedVersion>.fromScanner(scanner)) {
+			switch Dependency<PinnedVersion>.fromScanner(scanner) {
 			case let .Success(dep):
 				cartfile.dependencies.append(dep.value)
 
@@ -174,7 +175,7 @@ public enum ProjectIdentifier: Equatable {
 
 	/// The unique, user-visible name for this project.
 	public var name: String {
-		switch (self) {
+		switch self {
 		case let .GitHub(repo):
 			return repo.name
 
@@ -205,7 +206,7 @@ public func ==(lhs: ProjectIdentifier, rhs: ProjectIdentifier) -> Bool {
 
 extension ProjectIdentifier: Hashable {
 	public var hashValue: Int {
-		switch (self) {
+		switch self {
 		case let .GitHub(repo):
 			return repo.hashValue
 
@@ -251,7 +252,7 @@ extension ProjectIdentifier: Scannable {
 
 extension ProjectIdentifier: Printable {
 	public var description: String {
-		switch (self) {
+		switch self {
 		case let .GitHub(repo):
 			return "github \"\(repo)\""
 

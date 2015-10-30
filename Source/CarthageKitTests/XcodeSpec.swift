@@ -21,6 +21,32 @@ class XcodeSpec: QuickSpec {
 		let buildFolderURL = directoryURL.URLByAppendingPathComponent(CarthageBinariesFolderPath)
 		let targetFolderURL = NSURL(fileURLWithPath: NSTemporaryDirectory().stringByAppendingPathComponent(NSProcessInfo.processInfo().globallyUniqueString), isDirectory: true)!
 
+		var machineHasiOSIdentity: Bool = false
+		var sdkFilter: SDKFilterCallback = { .success($0.0) }
+
+		beforeSuite {
+			machineHasiOSIdentity = iOSSigningIdentitiesConfigured()
+
+			// Works around the test failure in CI environment for pull requests
+			// sent from forked repositories.
+			//
+			// See https://github.com/Carthage/Carthage/pull/766#issuecomment-141671784.
+			if !machineHasiOSIdentity {
+				sdkFilter = { args in
+					let filtered = args.0.filter { sdk in
+						switch sdk {
+						case .MacOSX, .iPhoneSimulator, .watchSimulator, .tvSimulator:
+							return true
+
+						case _:
+							return false
+						}
+					}
+					return .success(filtered)
+				}
+			}
+		}
+
 		beforeEach {
 			NSFileManager.defaultManager().removeItemAtURL(buildFolderURL, error: nil)
 
@@ -34,16 +60,13 @@ class XcodeSpec: QuickSpec {
 		}
 
 		it("should build for all platforms") {
-			let machineHasiOSIdentity = iOSSigningIdentitiesConfigured()
-			expect(machineHasiOSIdentity).to(equal(true))
-
 			let dependencies = [
 				ProjectIdentifier.GitHub(GitHubRepository(owner: "github", name: "Archimedes")),
 				ProjectIdentifier.GitHub(GitHubRepository(owner: "ReactiveCocoa", name: "ReactiveCocoa")),
 			]
 
 			for project in dependencies {
-				let result = buildDependencyProject(project, directoryURL, withConfiguration: "Debug")
+				let result = buildDependencyProject(project, directoryURL, withConfiguration: "Debug", sdkFilter: sdkFilter)
 					|> flatten(.Concat)
 					|> ignoreTaskData
 					|> on(next: { (project, scheme) in
@@ -54,7 +77,7 @@ class XcodeSpec: QuickSpec {
 				expect(result.error).to(beNil())
 			}
 
-			let result = buildInDirectory(directoryURL, withConfiguration: "Debug")
+			let result = buildInDirectory(directoryURL, withConfiguration: "Debug", sdkFilter: sdkFilter)
 				|> flatten(.Concat)
 				|> ignoreTaskData
 				|> on(next: { (project, scheme) in
@@ -128,6 +151,9 @@ class XcodeSpec: QuickSpec {
 				expect(strippedArchitectures?.value).notTo(contain("i386"))
 				expect(strippedArchitectures?.value).to(contain("armv7"))
 				expect(strippedArchitectures?.value).to(contain("arm64"))
+
+				let modulesDirectoryURL = targetURL.URLByAppendingPathComponent("Modules", isDirectory: true)
+				expect(NSFileManager.defaultManager().fileExistsAtPath(modulesDirectoryURL.path!)).to(beFalsy())
 				
 				var output: String = ""
 				let codeSign = TaskDescription(launchPath: "/usr/bin/xcrun", arguments: [ "codesign", "--verify", "--verbose", targetURL.path! ])
@@ -156,7 +182,7 @@ class XcodeSpec: QuickSpec {
 
 			NSFileManager.defaultManager().removeItemAtURL(_buildFolderURL, error: nil)
 
-			let result = buildInDirectory(_directoryURL, withConfiguration: "Debug")
+			let result = buildInDirectory(_directoryURL, withConfiguration: "Debug", sdkFilter: sdkFilter)
 				|> flatten(.Concat)
 				|> ignoreTaskData
 				|> on(next: { (project, scheme) in
@@ -230,7 +256,7 @@ class XcodeSpec: QuickSpec {
 
 		it("should build for multiple platforms") {
 			let project = ProjectIdentifier.GitHub(GitHubRepository(owner: "github", name: "Archimedes"))
-			let result = buildDependencyProject(project, directoryURL, withConfiguration: "Debug", platforms: [ .Mac, .iOS ])
+			let result = buildDependencyProject(project, directoryURL, withConfiguration: "Debug", platforms: [ .Mac, .iOS ], sdkFilter: sdkFilter)
 				|> flatten(.Concat)
 				|> ignoreTaskData
 				|> on(next: { (project, scheme) in
@@ -297,38 +323,6 @@ class XcodeSpec: QuickSpec {
 				|> single
 
 			expect(result?.value).to(equal(expectedOutput))
-		}
-		
-		it("should detect iPhone signing identities when present") {
-			let result = iOSSigningIdentitiesConfigured(identities: SignalProducer<CodeSigningIdentity, CarthageError>(values: [
-				"3rd Party Mac Developer Application",
-				"Mac Developer",
-				"iPhone Developer",
-				"Developer ID Application",
-			]))
-			
-			expect(result).to(beTruthy())
-		}
-		
-		it("should detect iOS signing identities when present (future compatibility)") {
-			let result = iOSSigningIdentitiesConfigured(identities: SignalProducer<CodeSigningIdentity, CarthageError>(values: [
-				"3rd Party Mac Developer Application",
-				"Mac Developer",
-				"iOS Developer",
-				"Developer ID Application",
-			]))
-			
-			expect(result).to(beTruthy())
-		}
-		
-		it("should detect when no iPhone or iOS signing identities when present") {			
-			let result = iOSSigningIdentitiesConfigured(identities: SignalProducer<CodeSigningIdentity, CarthageError>(values: [
-				"3rd Party Mac Developer Application",
-				"Mac Developer",
-				"Developer ID Application",
-			]))
-			
-			expect(result).to(beFalsy())
 		}
 	}
 }

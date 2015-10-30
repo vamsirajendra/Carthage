@@ -399,7 +399,18 @@ public func isGitRepository(directoryURL: NSURL) -> SignalProducer<Bool, NoError
 	}
 
 	return launchGitTask([ "rev-parse", "--git-dir", ], repositoryFileURL: directoryURL)
-		|> map { _ in true }
+		|> map { outputIncludingLineEndings in
+			let relativeOrAbsoluteGitDirectory = outputIncludingLineEndings.stringByTrimmingCharactersInSet(.newlineCharacterSet())
+			var absoluteGitDirectory: String?
+			if (relativeOrAbsoluteGitDirectory as NSString).absolutePath {
+				absoluteGitDirectory = relativeOrAbsoluteGitDirectory
+			} else {
+				absoluteGitDirectory = directoryURL.URLByAppendingPathComponent(relativeOrAbsoluteGitDirectory).path
+			}
+			var isDirectory: ObjCBool = false
+			let directoryExists = absoluteGitDirectory.map { NSFileManager.defaultManager().fileExistsAtPath($0, isDirectory: &isDirectory) } ?? false
+			return directoryExists && isDirectory
+		}
 		|> catch { _ in SignalProducer(value: false) }
 }
 
@@ -411,7 +422,7 @@ public func addSubmoduleToRepository(repositoryFileURL: NSURL, submodule: Submod
 	return isGitRepository(submoduleDirectoryURL)
 		|> promoteErrors(CarthageError.self)
 		|> flatMap(.Merge) { submoduleExists in
-			if (submoduleExists) {
+			if submoduleExists {
 				// Just check out and stage the correct revision.
 				return fetchRepository(submoduleDirectoryURL, remoteURL: fetchURL, refspec: "+refs/heads/*:refs/remotes/origin/*")
 					|> then(launchGitTask([ "config", "--file", ".gitmodules", "submodule.\(submodule.name).url", submodule.URL.URLString ], repositoryFileURL: repositoryFileURL))

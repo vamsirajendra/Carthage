@@ -108,6 +108,9 @@ public struct BuildArguments {
 	/// the native architecture.
 	public var onlyActiveArchitecture: OnlyActiveArchitecture = .NotSpecified
 
+	/// The build setting whether full bitcode should be embedded in the binary.
+	public var bitcodeGenerationMode: BitcodeGenerationMode = .None
+
 	public init(project: ProjectLocator, scheme: String? = nil, configuration: String? = nil, sdk: SDK? = nil) {
 		self.project = project
 		self.scheme = scheme
@@ -140,6 +143,7 @@ public struct BuildArguments {
 		}
 
 		args += onlyActiveArchitecture.arguments
+		args += bitcodeGenerationMode.arguments
 
 		return args
 	}
@@ -249,23 +253,23 @@ public func schemesInProject(project: ProjectLocator) -> SignalProducer<String, 
 		// xcodebuild has a bug where xcodebuild -list can sometimes hang
 		// indefinitely on projects that don't share any schemes, so
 		// automatically bail out if it looks like that's happening.
-		|> timeoutWithError(.XcodebuildListTimeout(project, nil), afterInterval: 8, onScheduler: QueueScheduler())
+		|> timeoutWithError(.XcodebuildListTimeout(project, nil), afterInterval: 15, onScheduler: QueueScheduler())
 		|> map { (line: String) -> String in line.stringByTrimmingCharactersInSet(NSCharacterSet.whitespaceCharacterSet()) }
 }
 
 /// Represents a platform to build for.
-public enum Platform {
+public enum Platform: String {
 	/// Mac OS X.
-	case Mac
+	case Mac = "Mac"
 
 	/// iOS for device and simulator.
-	case iOS
+	case iOS = "iOS"
 
 	/// Apple Watch device and simulator.
-	case watchOS
+	case watchOS = "watchOS"
 
 	/// Apple TV device and simulator.
-	case tvOS
+	case tvOS = "tvOS"
 
 	/// All supported build platforms.
 	public static let supportedPlatforms: [Platform] = [ .Mac, .iOS, .watchOS, .tvOS ]
@@ -273,22 +277,7 @@ public enum Platform {
 	/// The relative path at which binaries corresponding to this platform will
 	/// be stored.
 	public var relativePath: String {
-		let subfolderName: String
-
-		switch self {
-		case .Mac:
-			subfolderName = "Mac"
-
-		case .iOS:
-			subfolderName = "iOS"
-
-		case .watchOS:
-			subfolderName = "watchOS"
-
-		case .tvOS:
-			subfolderName = "tvOS"
-		}
-
+		let subfolderName = rawValue
 		return CarthageBinariesFolderPath.stringByAppendingPathComponent(subfolderName)
 	}
 
@@ -313,19 +302,7 @@ public enum Platform {
 // TODO: this won't be necessary anymore with Swift 2.
 extension Platform: Printable {
 	public var description: String {
-		switch self {
-		case .Mac:
-			return "Mac"
-
-		case .iOS:
-			return "iOS"
-
-		case .watchOS:
-			return "watchOS"
-
-		case .tvOS:
-			return "tvOS"
-		}
+		return rawValue
 	}
 }
 
@@ -354,7 +331,7 @@ public enum SDK: String {
 
 	/// Attempts to parse an SDK name from a string returned from `xcodebuild`.
 	public static func fromString(string: String) -> Result<SDK, CarthageError> {
-		return Result(self(rawValue: string), failWith: .ParseError(description: "unexpected SDK key \"\(string)\""))
+		return Result(self(rawValue: string.lowercaseString), failWith: .ParseError(description: "unexpected SDK key \"\(string)\""))
 	}
 
 	/// The platform that this SDK targets.
@@ -445,6 +422,31 @@ public enum OnlyActiveArchitecture {
 
 		case .No:
 			return [ "ONLY_ACTIVE_ARCH=NO" ]
+		}
+	}
+}
+
+/// Represents a build setting whether full bitcode should be embedded in the
+/// binary.
+public enum BitcodeGenerationMode: String {
+	/// None.
+	case None = ""
+
+	/// Only bitcode marker will be embedded.
+	case Marker = "marker"
+
+	/// Full bitcode will be embedded.
+	case Bitcode = "bitcode"
+
+	/// The arguments that should be passed to `xcodebuild` to specify the
+	/// setting for this case.
+	private var arguments: [String] {
+		switch self {
+		case .None:
+			return []
+
+		case .Marker, Bitcode:
+			return [ "BITCODE_GENERATION_MODE=\(rawValue)" ]
 		}
 	}
 }
@@ -625,6 +627,11 @@ public struct BuildSettings {
 		}
 	}
 
+	/// Attempts to determine whether bitcode is enabled or not.
+	public var bitcodeEnabled: Result<Bool, CarthageError> {
+		return self["ENABLE_BITCODE"].map { $0 == "YES" }
+	}
+
 	/// Attempts to determine the relative path (from the build folder) where
 	/// the Swift modules for the built product will exist.
 	///
@@ -650,6 +657,8 @@ extension BuildSettings: Printable {
 /// its name) into the given folder. The folder will be created if it does not
 /// already exist.
 ///
+/// If this built product has any *.bcsymbolmap files they will also be copied.
+///
 /// Returns a signal that will send the URL after copying upon .success.
 private func copyBuildProductIntoDirectory(directoryURL: NSURL, settings: BuildSettings) -> SignalProducer<NSURL, CarthageError> {
 	let target = settings.wrapperName.map(directoryURL.URLByAppendingPathComponent)
@@ -657,6 +666,24 @@ private func copyBuildProductIntoDirectory(directoryURL: NSURL, settings: BuildS
 		|> flatMap(.Merge) { (target, source) in
 			return copyProduct(source, target)
 		}
+		|> flatMap(.Merge) { url in
+			return copyBCSymbolMapsForBuildProductIntoDirectory(directoryURL, settings)
+				|> then(SignalProducer(value: url))
+		}
+}
+
+/// Finds any *.bcsymbolmap files for the built product and copies them into
+/// the given folder. Does nothing if bitcode is disabled.
+///
+/// Returns a signal that will send the URL after copying for each file.
+private func copyBCSymbolMapsForBuildProductIntoDirectory(directoryURL: NSURL, settings: BuildSettings) -> SignalProducer<NSURL, CarthageError> {
+	if settings.bitcodeEnabled.value == true {
+		let bcsymbolmapsProducer = SignalProducer(result: settings.wrapperURL)
+			|> flatMap(.Merge) { wrapperURL in BCSymbolMapsForFramework(wrapperURL) }
+		return copyFileURLsFromProducer(bcsymbolmapsProducer, intoDirectory: directoryURL)
+	} else {
+		return .empty
+	}
 }
 
 /// Attempts to merge the given executables into one fat binary, written to
@@ -775,6 +802,8 @@ private func settingsByTarget<Error>(producer: SignalProducer<TaskEvent<BuildSet
 /// been created from the same target, and differ only in the SDK they were
 /// built for.
 ///
+/// Any *.bcsymbolmap files for the built products are also copied.
+///
 /// Upon .success, sends the URL to the merged product, then completes.
 private func mergeBuildProductsIntoDirectory(firstProductSettings: BuildSettings, secondProductSettings: BuildSettings, destinationFolderURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
 	return copyBuildProductIntoDirectory(destinationFolderURL, firstProductSettings)
@@ -806,19 +835,20 @@ private func mergeBuildProductsIntoDirectory(firstProductSettings: BuildSettings
 
 			return mergeProductBinaries
 				|> then(mergeProductModules)
+				|> then(copyBCSymbolMapsForBuildProductIntoDirectory(destinationFolderURL, secondProductSettings))
 				|> then(SignalProducer(value: productURL))
 		}
 }
 
 
 /// A callback function used to determine whether or not an SDK should be built
-public typealias SDKFilterCallback = (sdks: [SDK], scheme: String, configuration: String, project: ProjectLocator) -> [SDK]
+public typealias SDKFilterCallback = (sdks: [SDK], scheme: String, configuration: String, project: ProjectLocator) -> Result<[SDK], CarthageError>
 
 /// Builds one scheme of the given project, for all supported SDKs.
 ///
 /// Returns a signal of all standard output from `xcodebuild`, and a signal
 /// which will send the URL to each product successfully built.
-public func buildScheme(scheme: String, withConfiguration configuration: String, inProject project: ProjectLocator, #workingDirectoryURL: NSURL, sdkFilter: SDKFilterCallback = { $0.0 }) -> SignalProducer<TaskEvent<NSURL>, CarthageError> {
+public func buildScheme(scheme: String, withConfiguration configuration: String, inProject project: ProjectLocator, #workingDirectoryURL: NSURL, sdkFilter: SDKFilterCallback = { .success($0.0) }) -> SignalProducer<TaskEvent<NSURL>, CarthageError> {
 	precondition(workingDirectoryURL.fileURL)
 
 	let buildArgs = BuildArguments(project: project, scheme: scheme, configuration: configuration)
@@ -838,7 +868,7 @@ public func buildScheme(scheme: String, withConfiguration configuration: String,
 		// simulator on the list, iPad 2 7.1, which is invalid for the target.
 		//
 		// See https://github.com/Carthage/Carthage/issues/417.
-		func fetchDestination() -> SignalProducer<String?, ReactiveTaskError> {
+		func fetchDestination() -> SignalProducer<String?, CarthageError> {
 			if sdk == .iPhoneSimulator {
 				let destinationLookup = TaskDescription(launchPath: "/usr/bin/xcrun", arguments: [ "simctl", "list", "devices" ])
 				return launchTask(destinationLookup)
@@ -857,13 +887,14 @@ public func buildScheme(scheme: String, withConfiguration configuration: String,
 							let deviceID = string.substringWithRange(result.rangeAtIndex(1))
 							return "platform=iOS Simulator,id=\(deviceID)"
 						}
-				}
+					}
+					|> mapError { .TaskError($0) }
 			}
 			return SignalProducer(value: nil)
 		}
 
 		return fetchDestination()
-			|> flatMap(.Concat) { destination -> SignalProducer<TaskEvent<NSData>, ReactiveTaskError> in
+			|> flatMap(.Concat) { destination -> SignalProducer<TaskEvent<BuildSettings>, CarthageError> in
 				if let destination = destination {
 					argsForBuilding.destination = destination
 					// Also set the destination lookup timeout. Since we're building
@@ -872,13 +903,6 @@ public func buildScheme(scheme: String, withConfiguration configuration: String,
 					argsForBuilding.destinationTimeout = 3
 				}
 
-				var buildScheme = xcodebuildTask("build", argsForBuilding)
-				buildScheme.workingDirectoryPath = workingDirectoryURL.path!
-
-				return launchTask(buildScheme)
-			}
-			|> mapError { .TaskError($0) }
-			|> flatMapTaskEvents(.Concat) { _ in
 				return BuildSettings.loadWithArguments(argsForLoading)
 					|> filter { settings in
 						// Only copy build products for the product types we care about.
@@ -888,37 +912,65 @@ public func buildScheme(scheme: String, withConfiguration configuration: String,
 							return false
 						}
 					}
+					|> flatMap(.Concat) { settings -> SignalProducer<TaskEvent<BuildSettings>, CarthageError> in
+						if settings.bitcodeEnabled.value == true {
+							argsForBuilding.bitcodeGenerationMode = .Bitcode
+						}
+
+						var buildScheme = xcodebuildTask("build", argsForBuilding)
+						buildScheme.workingDirectoryPath = workingDirectoryURL.path!
+
+						return launchTask(buildScheme)
+							|> map { taskEvent in
+								taskEvent.map { _ in settings }
+							}
+							|> mapError { .TaskError($0) }
+					}
 			}
 	}
 
 	return BuildSettings.SDKsForScheme(scheme, inProject: project)
-		|> collect
-		|> flatMap(.Concat) { (schemeSDKList: [SDK]) in
-			let platform: Platform! = schemeSDKList.first?.platform
-			
-			if platform == nil {
+		|> reduce([:]) { (var sdksByPlatform: [Platform: [SDK]], sdk: SDK) in
+			let platform = sdk.platform
+
+			if var sdks = sdksByPlatform[platform] {
+				sdks.append(sdk)
+				sdksByPlatform.updateValue(sdks, forKey: platform)
+			} else {
+				sdksByPlatform[platform] = [ sdk ]
+			}
+
+			return sdksByPlatform
+		}
+		|> flatMap(.Concat) { sdksByPlatform -> SignalProducer<(Platform, [SDK]), CarthageError> in
+			if sdksByPlatform.isEmpty {
 				fatalError("No SDKs found for scheme \(scheme)")
 			}
-			
+
+			let values = map(sdksByPlatform) { ($0, $1) }
+			return SignalProducer(values: values)
+		}
+		|> flatMap(.Concat) { platform, sdks -> SignalProducer<(Platform, [SDK]), CarthageError> in
+			let filterResult = sdkFilter(sdks: sdks, scheme: scheme, configuration: configuration, project: project)
+			return SignalProducer(result: filterResult.map { (platform, $0) })
+		}
+		|> filter { _, sdks in
+			return !sdks.isEmpty
+		}
+		|> flatMap(.Concat) { platform, sdks in
 			let folderURL = workingDirectoryURL.URLByAppendingPathComponent(platform.relativePath, isDirectory: true).URLByResolvingSymlinksInPath!
-			
-			let sdksToBuild = sdkFilter(sdks: schemeSDKList, scheme: scheme, configuration: configuration, project: project)
-			
+
 			// TODO: Generalize this further?
-			switch sdksToBuild.count {
-			case 0:
-				let isMissingSigningIdentities = !schemeSDKList.isEmpty
-				let identityAddendum = isMissingSigningIdentities ? " (you're missing one or more signing identities)" : ""
-				fatalError("No valid SDKs found to build\(identityAddendum)")
+			switch sdks.count {
 			case 1:
-				return buildSDK(sdksToBuild[0])
+				return buildSDK(sdks[0])
 					|> flatMapTaskEvents(.Merge) { settings in
 						return copyBuildProductIntoDirectory(folderURL, settings)
 					}
 
 			case 2:
-				let firstSDK = sdksToBuild[0]
-				let secondSDK = sdksToBuild[1]
+				let firstSDK = sdks[0]
+				let secondSDK = sdks[1]
 
 				return settingsByTarget(buildSDK(firstSDK))
 					|> flatMap(.Concat) { settingsEvent -> SignalProducer<TaskEvent<(BuildSettings, BuildSettings)>, CarthageError> in
@@ -956,7 +1008,7 @@ public func buildScheme(scheme: String, withConfiguration configuration: String,
 					}
 
 			default:
-				fatalError("SDK count \(sdksToBuild.count) in scheme \(scheme) is not supported")
+				fatalError("SDK count \(sdks.count) in scheme \(scheme) is not supported")
 			}
 		}
 		|> flatMapTaskEvents(.Concat) { builtProductURL in
@@ -990,7 +1042,7 @@ public typealias BuildSchemeProducer = SignalProducer<TaskEvent<(ProjectLocator,
 /// places its build product into the root directory given.
 ///
 /// Returns producers in the same format as buildInDirectory().
-public func buildDependencyProject(dependency: ProjectIdentifier, rootDirectoryURL: NSURL, withConfiguration configuration: String, platforms: Set<Platform> = [], sdkFilter: SDKFilterCallback = { $0.0 }) -> SignalProducer<BuildSchemeProducer, CarthageError> {
+public func buildDependencyProject(dependency: ProjectIdentifier, rootDirectoryURL: NSURL, withConfiguration configuration: String, platforms: Set<Platform> = [], sdkFilter: SDKFilterCallback = { .success($0.0) }) -> SignalProducer<BuildSchemeProducer, CarthageError> {
 	let rootBinariesURL = rootDirectoryURL.URLByAppendingPathComponent(CarthageBinariesFolderPath, isDirectory: true).URLByResolvingSymlinksInPath!
 	let rawDependencyURL = rootDirectoryURL.URLByAppendingPathComponent(dependency.relativePath, isDirectory: true)
 	let dependencyURL = rawDependencyURL.URLByResolvingSymlinksInPath!
@@ -1116,7 +1168,7 @@ public func parseSecuritySigningIdentities(securityIdentities: SignalProducer<St
 ///
 /// Returns a signal of all standard output from `xcodebuild`, and a
 /// signal-of-signals representing each scheme being built.
-public func buildInDirectory(directoryURL: NSURL, withConfiguration configuration: String, platforms: Set<Platform> = [], sdkFilter: SDKFilterCallback = { $0.0 }) -> SignalProducer<BuildSchemeProducer, CarthageError> {
+public func buildInDirectory(directoryURL: NSURL, withConfiguration configuration: String, platforms: Set<Platform> = [], sdkFilter: SDKFilterCallback = { .success($0.0) }) -> SignalProducer<BuildSchemeProducer, CarthageError> {
 	precondition(directoryURL.fileURL)
 
 	return SignalProducer { observer, disposable in
@@ -1205,7 +1257,18 @@ public func buildInDirectory(directoryURL: NSURL, withConfiguration configuratio
 			|> map { (scheme: String, project: ProjectLocator) -> BuildSchemeProducer in
 				let initialValue = (project, scheme)
 
-				let buildProgress = buildScheme(scheme, withConfiguration: configuration, inProject: project, workingDirectoryURL: directoryURL, sdkFilter: sdkFilter)
+				let wrappedSDKFilter: SDKFilterCallback = { sdks, scheme, configuration, project in
+					let filteredSDKs: [SDK]
+					if platforms.isEmpty {
+						filteredSDKs = sdks
+					} else {
+						filteredSDKs = sdks.filter { platforms.contains($0.platform) }
+					}
+
+					return sdkFilter(sdks: filteredSDKs, scheme: scheme, configuration: configuration, project: project)
+				}
+
+				let buildProgress = buildScheme(scheme, withConfiguration: configuration, inProject: project, workingDirectoryURL: directoryURL, sdkFilter: wrappedSDKFilter)
 					// Discard any existing Success values, since we want to
 					// use our initial value instead of waiting for
 					// completion.
@@ -1227,12 +1290,18 @@ public func buildInDirectory(directoryURL: NSURL, withConfiguration configuratio
 /// Strips a framework from unexpected architectures, optionally codesigning the
 /// result.
 public func stripFramework(frameworkURL: NSURL, #keepingArchitectures: [String], codesigningIdentity: String? = nil) -> SignalProducer<(), CarthageError> {
-	let strip = architecturesInFramework(frameworkURL)
+	let stripArchitectures = architecturesInFramework(frameworkURL)
 		|> filter { !contains(keepingArchitectures, $0) }
 		|> flatMap(.Concat) { stripArchitecture(frameworkURL, $0) }
 
+	// Xcode doesn't copy `Modules` directory at all.
+	let stripModules = stripModulesDirectory(frameworkURL)
+
 	let sign = codesigningIdentity.map { codesign(frameworkURL, $0) } ?? .empty
-	return strip |> concat(sign)
+
+	return stripArchitectures
+		|> concat(stripModules)
+		|> concat(sign)
 }
 
 /// Copies a product into the given folder. The folder will be created if it
@@ -1266,6 +1335,21 @@ public func copyProduct(from: NSURL, to: NSURL) -> SignalProducer<NSURL, Carthag
 		} else {
 			return .failure(.WriteFailed(to, error))
 		}
+	}
+}
+
+/// Copies existing files sent from the given producer into the given directory.
+///
+/// Returns a producer that will send locations where the copied files are.
+public func copyFileURLsFromProducer(producer: SignalProducer<NSURL, CarthageError>, intoDirectory directoryURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
+	return producer
+		|> filter { fileURL in fileURL.checkResourceIsReachableAndReturnError(nil) }
+		|> flatMap(.Merge) { fileURL in
+			let fileName = fileURL.lastPathComponent!
+			let destinationURL = directoryURL.URLByAppendingPathComponent(fileName, isDirectory: false)
+			let resolvedDestinationURL = destinationURL.URLByResolvingSymlinksInPath!
+
+			return copyProduct(fileURL, resolvedDestinationURL)
 	}
 }
 
@@ -1344,6 +1428,25 @@ public func architecturesInFramework(frameworkURL: NSURL) -> SignalProducer<Stri
 		}
 }
 
+/// Strips `Modules` directory from the given framework.
+public func stripModulesDirectory(frameworkURL: NSURL) -> SignalProducer<(), CarthageError> {
+	return SignalProducer.try {
+		let modulesDirectoryURL = frameworkURL.URLByAppendingPathComponent("Modules", isDirectory: true)
+
+		var isDirectory: ObjCBool = false
+		if !NSFileManager.defaultManager().fileExistsAtPath(modulesDirectoryURL.path!, isDirectory: &isDirectory) || !isDirectory {
+			return .success(())
+		}
+
+		var error: NSError? = nil
+		if !NSFileManager.defaultManager().removeItemAtURL(modulesDirectoryURL, error: &error) {
+			return .failure(.WriteFailed(modulesDirectoryURL, error))
+		}
+
+		return .success(())
+	}
+}
+
 /// Sends a set of UUIDs for each architecture present in the given framework.
 public func UUIDsForFramework(frameworkURL: NSURL) -> SignalProducer<Set<NSUUID>, CarthageError> {
 	return SignalProducer.try { () -> Result<NSURL, CarthageError> in
@@ -1355,6 +1458,19 @@ public func UUIDsForFramework(frameworkURL: NSURL) -> SignalProducer<Set<NSUUID>
 /// Sends a set of UUIDs for each architecture present in the given dSYM.
 public func UUIDsForDSYM(dSYMURL: NSURL) -> SignalProducer<Set<NSUUID>, CarthageError> {
 	return UUIDsFromDwarfdump(dSYMURL)
+}
+
+/// Sends an NSURL for each bcsymbolmap file for the given framework.
+/// The files do not necessarily exist on disk.
+///
+/// The returned URLs are relative to the parent directory of the framework.
+public func BCSymbolMapsForFramework(frameworkURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
+	let directoryURL = frameworkURL.URLByDeletingLastPathComponent!
+	return UUIDsForFramework(frameworkURL)
+		|> flatMap(.Merge) { UUIDs in SignalProducer(values: UUIDs) }
+		|> map { UUID in
+			return directoryURL.URLByAppendingPathComponent(UUID.UUIDString, isDirectory: false).URLByAppendingPathExtension("bcsymbolmap")
+		}
 }
 
 /// Sends a set of UUIDs for each architecture present in the given URL.

@@ -13,23 +13,49 @@ import ReactiveCocoa
 /// Carthage’s bundle identifier.
 public let CarthageKitBundleIdentifier = NSBundle(forClass: Project.self).bundleIdentifier!
 
+/// The fallback dependencies URL to be used in case
+/// the intended ~/Library/Caches/org.carthage.CarthageKit cannot
+/// be found or created.
+private let fallbackDependenciesURL: NSURL = {
+	let homePath: String
+	if let homeEnvValue = NSProcessInfo.processInfo().environment["HOME"] as? NSString {
+		homePath = homeEnvValue.stringByAppendingPathComponent(".carthage")
+	} else {
+		homePath = "~/.carthage".stringByExpandingTildeInPath
+	}
+	return NSURL.fileURLWithPath(homePath, isDirectory:true)!
+}()
+
 /// ~/Library/Caches/org.carthage.CarthageKit/
 private let CarthageUserCachesURL: NSURL = {
-	let URL: Result<NSURL, NSError> = try({ (error: NSErrorPointer) -> NSURL? in
-		NSFileManager.defaultManager().URLForDirectory(NSSearchPathDirectory.CachesDirectory, inDomain: NSSearchPathDomainMask.UserDomainMask, appropriateForURL: nil, create: true, error: error)
-	})
-
-	let fallbackDependenciesURL = NSURL.fileURLWithPath("~/.carthage".stringByExpandingTildeInPath, isDirectory:true)!
-
-	switch URL {
-	case .Success:
-		NSFileManager.defaultManager().removeItemAtURL(fallbackDependenciesURL, error: nil)
-
-	case let .Failure(error):
-		NSLog("Warning: No Caches directory could be found or created: \(error.value.localizedDescription). (\(error.value))")
+	let fileManager = NSFileManager.defaultManager()
+	
+	let URLResult: Result<NSURL, NSError> = try({ (error: NSErrorPointer) -> NSURL? in
+		fileManager.URLForDirectory(NSSearchPathDirectory.CachesDirectory, inDomain: NSSearchPathDomainMask.UserDomainMask, appropriateForURL: nil, create: true, error: error)
+	}).flatMap { cachesURL in
+		let dependenciesURL = cachesURL.URLByAppendingPathComponent(CarthageKitBundleIdentifier, isDirectory: true)
+		let dependenciesPath = dependenciesURL.absoluteString!
+		
+		if fileManager.fileExistsAtPath(dependenciesPath, isDirectory:nil) {
+			if fileManager.isWritableFileAtPath(dependenciesPath) {
+				return Result(value: dependenciesURL)
+			} else {
+				let error = NSError(domain: CarthageKitBundleIdentifier, code: 0, userInfo: nil)
+				return Result(error: error)
+			}
+		} else {
+			return try { fileManager.createDirectoryAtURL(dependenciesURL, withIntermediateDirectories: true, attributes: [NSFilePosixPermissions : NSNumber(short:755)], error: $0) }.map { dependenciesURL }
+		}
 	}
 
-	return URL.value?.URLByAppendingPathComponent(CarthageKitBundleIdentifier, isDirectory: true) ?? fallbackDependenciesURL
+	switch URLResult {
+	case let .Success(URL):
+		NSFileManager.defaultManager().removeItemAtURL(fallbackDependenciesURL, error: nil)
+		return URL.value
+	case let .Failure(error):
+		NSLog("Warning: No Caches directory could be found or created: \(error.value.localizedDescription). (\(error.value))")
+		return fallbackDependenciesURL
+	}
 }()
 
 /// The file URL to the directory in which downloaded release binaries will be
@@ -341,6 +367,7 @@ public final class Project {
 								|> flatMap(.Merge, self.copyFrameworkToBuildFolder)
 								|> flatMap(.Merge) { frameworkURL in
 									return self.copyDSYMToBuildFolderForFramework(frameworkURL, fromDirectoryURL: directoryURL)
+										|> then(self.copyBCSymbolMapsToBuildFolderForFramework(frameworkURL, fromDirectoryURL: directoryURL))
 								}
 								|> on(completed: {
 									_ = NSFileManager.defaultManager().trashItemAtURL(checkoutDirectoryURL, resultingItemURL: nil, error: nil)
@@ -385,7 +412,7 @@ public final class Project {
 				}
 			}
 			|> on(next: { release in
-				sendNext(self._projectEventsObserver, ProjectEvent.DownloadingBinaries(project, release.nameWithFallback))
+				sendNext(self._projectEventsObserver, .DownloadingBinaries(project, release.nameWithFallback))
 			})
 			|> flatMap(.Concat) { release -> SignalProducer<NSURL, CarthageError> in
 				return SignalProducer(values: release.assets)
@@ -408,15 +435,12 @@ public final class Project {
 	///
 	/// Sends the URL to the framework after copying.
 	private func copyFrameworkToBuildFolder(frameworkURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
-		return architecturesInFramework(frameworkURL)
-			|> filter { arch in arch.hasPrefix("arm") }
-			|> map { _ in SDK.iPhoneOS }
-			|> concat(SignalProducer(value: SDK.MacOSX))
-			|> take(1)
-			|> map { sdk in sdk.platform }
-			|> map { platform in self.directoryURL.URLByAppendingPathComponent(platform.relativePath, isDirectory: true) }
-			|> map { platformFolderURL in platformFolderURL.URLByAppendingPathComponent(frameworkURL.lastPathComponent!) }
-			|> flatMap(.Merge) { destinationFrameworkURL in copyProduct(frameworkURL, destinationFrameworkURL.URLByResolvingSymlinksInPath!) }
+		return infoPlistForFramework(frameworkURL)
+			|> flatMap(.Merge) { infoPlistURL in platformForInfoPlist(infoPlistURL) }
+			|> flatMap(.Merge) { platform in
+				let platformFolderURL = self.directoryURL.URLByAppendingPathComponent(platform.relativePath, isDirectory: true)
+				return copyFileURLsFromProducer(SignalProducer(value: frameworkURL), intoDirectory: platformFolderURL)
+			}
 	}
 
 	/// Copies the DSYM matching the given framework and contained within the
@@ -426,15 +450,23 @@ public final class Project {
 	///
 	/// Sends the URL of the dSYM after copying.
 	public func copyDSYMToBuildFolderForFramework(frameworkURL: NSURL, fromDirectoryURL directoryURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
-		return dSYMForFramework(frameworkURL, inDirectoryURL:directoryURL)
-			|> flatMap(.Merge) { dSYMURL in
-				let destinationDirectoryURL = frameworkURL.URLByDeletingLastPathComponent!
-				let fileName = dSYMURL.lastPathComponent!
-				let destinationURL = destinationDirectoryURL.URLByAppendingPathComponent(fileName)
-				let resolvedDestinationURL = destinationURL.URLByResolvingSymlinksInPath!
-
-				return copyProduct(dSYMURL, resolvedDestinationURL)
-			}
+		let destinationDirectoryURL = frameworkURL.URLByDeletingLastPathComponent!
+		let dSYMProducer = dSYMForFramework(frameworkURL, inDirectoryURL:directoryURL)
+		return copyFileURLsFromProducer(dSYMProducer, intoDirectory: destinationDirectoryURL)
+	}
+	
+	/// Copies any *.bcsymbolmap files matching the given framework and contained
+	/// within the given directory URL to the directory that the framework
+	/// resides within.
+	///
+	/// If no bcsymbolmap files are found for the given framework, completes with
+	/// no values.
+	///
+	/// Sends the URLs of the bcsymbolmap files after copying.
+	public func copyBCSymbolMapsToBuildFolderForFramework(frameworkURL: NSURL, fromDirectoryURL directoryURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
+		let destinationDirectoryURL = frameworkURL.URLByDeletingLastPathComponent!
+		let bcsymbolmapsProducer = BCSymbolMapsForFramework(frameworkURL, inDirectoryURL: directoryURL)
+		return copyFileURLsFromProducer(bcsymbolmapsProducer, intoDirectory: destinationDirectoryURL)
 	}
 
 	/// Checks out the given project into its intended working directory,
@@ -523,7 +555,7 @@ public final class Project {
 	/// Attempts to build each Carthage dependency that has been checked out.
 	///
 	/// Returns a producer-of-producers representing each scheme being built.
-	public func buildCheckedOutDependenciesWithConfiguration(configuration: String, forPlatforms platforms: Set<Platform>, sdkFilter: SDKFilterCallback = { $0.0 }) -> SignalProducer<BuildSchemeProducer, CarthageError> {
+	public func buildCheckedOutDependenciesWithConfiguration(configuration: String, forPlatforms platforms: Set<Platform>, sdkFilter: SDKFilterCallback = { .success($0.0) }) -> SignalProducer<BuildSchemeProducer, CarthageError> {
 		return loadResolvedCartfile()
 			|> flatMap(.Merge) { resolvedCartfile in SignalProducer(values: resolvedCartfile.dependencies) }
 			|> flatMap(.Concat) { dependency -> SignalProducer<BuildSchemeProducer, CarthageError> in
@@ -597,21 +629,89 @@ private func cacheDownloadedBinary(downloadURL: NSURL, toURL cachedURL: NSURL) -
 }
 
 /// Sends the URL to each file found in the given directory conforming to the
-/// given type identifier.
-private func filesInDirectory(directoryURL: NSURL, typeIdentifier: String) -> SignalProducer<NSURL, CarthageError> {
-	return NSFileManager.defaultManager().carthage_enumeratorAtURL(directoryURL, includingPropertiesForKeys: [ NSURLTypeIdentifierKey ], options: NSDirectoryEnumerationOptions.SkipsHiddenFiles | NSDirectoryEnumerationOptions.SkipsPackageDescendants, catchErrors: true)
+/// given type identifier. If no type identifier is provided, all files are sent.
+private func filesInDirectory(directoryURL: NSURL, _ typeIdentifier: String? = nil) -> SignalProducer<NSURL, CarthageError> {
+	let producer = NSFileManager.defaultManager().carthage_enumeratorAtURL(directoryURL, includingPropertiesForKeys: [ NSURLTypeIdentifierKey ], options: .SkipsHiddenFiles | .SkipsPackageDescendants, catchErrors: true)
 		|> map { enumerator, URL in URL }
-		|> filter { URL in
-			return URL.typeIdentifier
+	if let typeIdentifier = typeIdentifier {
+		return producer
+			|> filter { URL in
+				return URL.typeIdentifier
+					.analysis(ifSuccess: { identifier in
+						return UTTypeConformsTo(identifier, typeIdentifier) != 0
+					}, ifFailure: { _ in false })
+			}
+	} else {
+		return producer
+	}
+}
+
+/// Sends the URL for the Info.plist of the specified Framework.
+private func infoPlistForFramework(frameworkURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
+	// The paths at which the Info.plist can be located within a framework:
+	let infoPlistCantidatePaths = [
+		// iOS, watchOS, and tvOS
+		"/Info.plist",
+		// Mac OSX
+		"/Resources/Info.plist",
+	]
+
+	return SignalProducer(values: infoPlistCantidatePaths.map { frameworkURL.URLByAppendingPathComponent($0) })
+		|> filter { infoPlistCantidateURL in
+			var isDirectory: ObjCBool = false
+			return NSFileManager.defaultManager().fileExistsAtPath(infoPlistCantidateURL.path!, isDirectory: &isDirectory) && !isDirectory
+		}
+		|> filter { (infoPlistCantidateURL: NSURL) in
+			return infoPlistCantidateURL.typeIdentifier
 				.analysis(ifSuccess: { identifier in
-					return UTTypeConformsTo(identifier, typeIdentifier) != 0
+					return UTTypeConformsTo(identifier, "com.apple.property-list") != 0
 				}, ifFailure: { _ in false })
 		}
+		|> take(1)
+}
+
+/// Sends the platform specified in the given Info.plist.
+private func platformForInfoPlist(plistURL: NSURL) -> SignalProducer<Platform, CarthageError> {
+	return SignalProducer.try { () -> Result<NSData, CarthageError> in
+			var error: NSError?
+			if let data = NSData(contentsOfURL: plistURL, options: nil, error: &error) {
+				return .success(data)
+			}
+			return .failure(.ReadFailed(plistURL, error))
+		}
+		|> startOn(QueueScheduler(name: "org.carthage.CarthageKit.Project.platformForInfoPlist"))
+		|> tryMap { (data: NSData) -> Result<AnyObject, CarthageError> in
+			var error: NSError?
+			let options = NSPropertyListReadOptions(NSPropertyListMutabilityOptions.Immutable.rawValue)
+			let plist: AnyObject? = NSPropertyListSerialization.propertyListWithData(data, options: options, format: nil, error: &error)
+			if let pist: AnyObject = plist {
+				return .success(pist)
+			}
+			return .failure(.ReadFailed(plistURL, error))
+		}
+		|> tryMap { plist -> Result<[String: AnyObject], CarthageError> in
+			if let plist = plist as? [String: AnyObject] {
+				return .success(plist)
+			}
+			return .failure(.InfoPlistParseFailed(plistURL: plistURL, reason: "the root plist object is not a dictionary of values by strings"))
+		}
+		// Neither DTPlatformName nor CFBundleSupportedPlatforms can not be used 
+		// because Xcode 6 and below do not include either in Mac OSX frameworks.
+		|> tryMap { plist -> Result<String, CarthageError> in
+			if let sdkName = plist["DTSDKName"] as? String {
+				return .success(sdkName)
+			}
+			return .failure(.InfoPlistParseFailed(plistURL: plistURL, reason: "the value for the DTSDKName key is not a string"))
+		}
+		// Thus, the SDK name must be trimmed to match the platform name, e.g.
+		// macosx10.10 -> macosx
+		|> map { sdkName in sdkName.stringByTrimmingCharactersInSet(NSCharacterSet.letterCharacterSet().invertedSet) }
+		|> tryMap { platform in SDK.fromString(platform).map { $0.platform } }
 }
 
 /// Sends the URL to each framework bundle found in the given directory.
 private func frameworksInDirectory(directoryURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
-	return filesInDirectory(directoryURL, kUTTypeFramework as! String)
+	return filesInDirectory(directoryURL, (kUTTypeFramework as! String))
 		|> filter { URL in
 			// Skip nested frameworks
 			let frameworksInURL = URL.pathComponents?.filter { pathComponent in
@@ -641,6 +741,38 @@ private func dSYMForFramework(frameworkURL: NSURL, inDirectoryURL directoryURL: 
 				}
 		}
 		|> take(1)
+}
+
+/// Sends the URL to each bcsymbolmap found in the given directory.
+private func BCSymbolMapsInDirectory(directoryURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
+	return filesInDirectory(directoryURL)
+		|> filter { URL in URL.pathExtension == "bcsymbolmap" }
+}
+
+/// Sends the URLs of the bcsymbolmap files that match the given framework and are
+/// located somewhere within the given directory.
+private func BCSymbolMapsForFramework(frameworkURL: NSURL, inDirectoryURL directoryURL: NSURL) -> SignalProducer<NSURL, CarthageError> {
+	return UUIDsForFramework(frameworkURL)
+		|> flatMap(.Merge) { UUIDs in
+			if UUIDs.isEmpty {
+				return .empty
+			}
+			func filterUUIDs(signal: Signal<NSURL, CarthageError>) -> Signal<NSURL, CarthageError> {
+				var remainingUUIDs = UUIDs
+				let count = remainingUUIDs.count
+				return signal
+					|> filter { fileURL in
+						if let basename = fileURL.lastPathComponent?.stringByDeletingPathExtension, fileUUID = NSUUID(UUIDString: basename) {
+							return remainingUUIDs.remove(fileUUID) != nil
+						} else {
+							return false
+						}
+					}
+					|> take(count)
+			}
+			return BCSymbolMapsInDirectory(directoryURL)
+				|> filterUUIDs
+	}
 }
 
 /// Determines whether a Release is a suitable candidate for binary frameworks.
@@ -711,7 +843,7 @@ public func cloneOrFetchProject(project: ProjectIdentifier, #preferHTTPS: Bool) 
 			let cloneProducer: () -> SignalProducer<(ProjectEvent, NSURL), CarthageError> = {
 				let cloneProducer = cloneRepository(remoteURL, repositoryURL)
 
-				return SignalProducer(value: (ProjectEvent.Cloning(project), repositoryURL))
+				return SignalProducer(value: (.Cloning(project), repositoryURL))
 					|> concat(cloneProducer |> then(.empty))
 			}
 
@@ -726,7 +858,7 @@ public func cloneOrFetchProject(project: ProjectIdentifier, #preferHTTPS: Bool) 
 						if isRepository {
 							let fetchProducer = fetchRepository(repositoryURL, remoteURL: remoteURL, refspec: "+refs/heads/*:refs/heads/*") /* lol syntax highlighting */
 
-							return SignalProducer(value: (ProjectEvent.Fetching(project), repositoryURL))
+							return SignalProducer(value: (.Fetching(project), repositoryURL))
 								|> concat(fetchProducer |> then(.empty))
 						} else {
 							// If the directory isn't a repository (that might
