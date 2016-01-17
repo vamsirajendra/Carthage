@@ -35,21 +35,97 @@ public struct Resolver {
 	///
 	/// Sends each recursive dependency with its resolved version, in the order
 	/// that they should be built.
-	public func resolveDependenciesInCartfile(cartfile: Cartfile) -> SignalProducer<Dependency<PinnedVersion>, CarthageError> {
-		return nodePermutationsForCartfile(cartfile)
-			|> flatMap(.Concat) { rootNodes -> SignalProducer<Event<DependencyGraph, CarthageError>, CarthageError> in
+	public func resolveDependenciesInCartfile(cartfile: Cartfile, lastResolved: ResolvedCartfile? = nil, dependenciesToUpdate: [String]? = nil) -> SignalProducer<Dependency<PinnedVersion>, CarthageError> {
+		return resolveDependenciesFromNodePermutations(nodePermutationsForCartfile(cartfile))
+			.flatMap(.Merge) { graph -> SignalProducer<Dependency<PinnedVersion>, CarthageError> in
+				let orderedNodes = graph.orderedNodes.map { node -> DependencyNode in
+					node.dependencies = graph.edges[node] ?? []
+					return node
+				}
+				let orderedNodesProducer = SignalProducer<DependencyNode, CarthageError>(values: orderedNodes)
+
+				guard
+					let dependenciesToUpdate = dependenciesToUpdate,
+					let lastResolved = lastResolved
+					where !dependenciesToUpdate.isEmpty else {
+					// All the dependencies are affected.
+					return orderedNodesProducer.map { node in node.dependencyVersion }
+				}
+
+				// When target dependencies are specified
+				return orderedNodesProducer.map { node -> Dependency<PinnedVersion>? in
+					// A dependency included in the targets should be affected.
+					if dependenciesToUpdate.contains(node.project.name) {
+						return node.dependencyVersion
+					}
+
+					// Nested dependencies of the targets should also be affected.
+					if graph.dependencies(dependenciesToUpdate, containsNestedDependencyOfNode: node) {
+						return node.dependencyVersion
+					}
+
+					// The dependencies which are not related to the targets
+					// should not be affected, so use the version in the last
+					// Cartfile.resolved.
+					if let dependencyForProject = lastResolved.dependencyForProject(node.project) {
+						return dependencyForProject
+					}
+
+					// Skip newly added nodes which are not in the targets.
+					return nil
+				}
+				.ignoreNil()
+			}
+	}
+
+	/// Attempts to determine the build order for the resolved dependencies,
+	/// optionally they are limited by the given list of dependency names.
+	///
+	/// Sends each recursive dependency with its already resolved version, in the
+	/// order that they should be built.
+	public func resolveDependenciesInResolvedCartfile(resolvedCartfile: ResolvedCartfile, dependenciesToResolve: [String]? = nil) -> SignalProducer<Dependency<PinnedVersion>, CarthageError> {
+		let nodes = resolvedCartfile.dependencies.map {
+			DependencyNode(
+				project: $0.project,
+				proposedVersion: $0.version,
+				versionSpecifier: .GitReference($0.version.commitish)
+			)
+		}
+		return resolveDependenciesFromNodePermutations(SignalProducer(value: nodes))
+			.flatMap(.Merge) { graph -> SignalProducer<Dependency<PinnedVersion>, CarthageError> in
+				let dependencies = graph.orderedNodes.map { node -> DependencyNode in
+					node.dependencies = graph.edges[node] ?? []
+					return node
+				}
+
+				guard let dependenciesToResolve = dependenciesToResolve where !dependenciesToResolve.isEmpty else {
+					return .init(values: dependencies.map { $0.dependencyVersion })
+				}
+
+				var toResolve = Set(dependenciesToResolve)
+
+				dependencies
+					.filter { toResolve.contains($0.project.name) }
+					.forEach { toResolve.unionInPlace($0.dependencies.map { $0.project.name }) }
+
+				let filtered = dependencies
+					.filter { toResolve.contains($0.project.name) }
+					.map { $0.dependencyVersion }
+				return .init(values: filtered)
+			}
+	}
+
+	private func resolveDependenciesFromNodePermutations(permutationsProducer: SignalProducer<[DependencyNode], CarthageError>) -> SignalProducer<DependencyGraph, CarthageError> {
+		return permutationsProducer
+			.flatMap(.Concat) { rootNodes -> SignalProducer<Event<DependencyGraph, CarthageError>, CarthageError> in
 				return self.graphPermutationsForEachNode(rootNodes, dependencyOf: nil, basedOnGraph: DependencyGraph())
-					|> promoteErrors(CarthageError.self)
+					.promoteErrors(CarthageError.self)
 			}
 			// Pass through resolution errors only if we never got
 			// a valid graph.
-			|> dematerializeErrorsIfEmpty
-			|> take(1)
-			|> observeOn(QueueScheduler(name: "org.carthage.CarthageKit.Resolver.resolveDependencesInCartfile"))
-			|> flatMap(.Merge) { graph -> SignalProducer<Dependency<PinnedVersion>, CarthageError> in
-				return SignalProducer(values: graph.orderedNodes)
-					|> map { node in node.dependencyVersion }
-			}
+			.dematerializeErrorsIfEmpty()
+			.take(1)
+			.observeOn(QueueScheduler(queue: dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), name: "org.carthage.CarthageKit.Resolver.resolveDependencesInCartfile"))
 	}
 
 	/// Sends all permutations of valid DependencyNodes, corresponding to the
@@ -61,43 +137,43 @@ public struct Resolver {
 	/// of those dependencies (chosen from among the versions that actually
 	/// exist for each).
 	private func nodePermutationsForCartfile(cartfile: Cartfile) -> SignalProducer<[DependencyNode], CarthageError> {
-		let scheduler = QueueScheduler(name: "org.carthage.CarthageKit.Resolver.nodePermutationsForCartfile")
+		let scheduler = QueueScheduler(queue: dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), name: "org.carthage.CarthageKit.Resolver.nodePermutationsForCartfile")
 
 		return SignalProducer(values: cartfile.dependencies)
-			|> map { dependency -> SignalProducer<DependencyNode, CarthageError> in
-				let allowedVersions = SignalProducer<String?, CarthageError>.try {
+			.map { dependency -> SignalProducer<DependencyNode, CarthageError> in
+				let allowedVersions = SignalProducer<String?, CarthageError>.attempt {
 						switch dependency.version {
 						case let .GitReference(refName):
-							return .success(refName)
+							return .Success(refName)
 
 						default:
-							return .success(nil)
+							return .Success(nil)
 						}
 					}
-					|> flatMap(.Concat) { refName -> SignalProducer<PinnedVersion, CarthageError> in
+					.flatMap(.Concat) { refName -> SignalProducer<PinnedVersion, CarthageError> in
 						if let refName = refName {
 							return self.resolvedGitReference(dependency.project, refName)
 						}
 
 						return self.versionsForDependency(dependency.project)
-							|> collect
-							|> flatMap(.Merge) { nodes -> SignalProducer<PinnedVersion, CarthageError> in
+							.collect()
+							.flatMap(.Merge) { nodes -> SignalProducer<PinnedVersion, CarthageError> in
 								if nodes.isEmpty {
 									return SignalProducer(error: CarthageError.TaggedVersionNotFound(dependency.project))
 								} else {
 									return SignalProducer(values: nodes)
 								}
 							}
-							|> filter { dependency.version.satisfiedBy($0) }
+							.filter { dependency.version.satisfiedBy($0) }
 					}
 
 				return allowedVersions
-					|> startOn(scheduler)
-					|> observeOn(scheduler)
-					|> map { DependencyNode(project: dependency.project, proposedVersion: $0, versionSpecifier: dependency.version) }
-					|> collect
-					|> map(sorted)
-					|> flatMap(.Concat) { nodes -> SignalProducer<DependencyNode, CarthageError> in
+					.startOn(scheduler)
+					.observeOn(scheduler)
+					.map { DependencyNode(project: dependency.project, proposedVersion: $0, versionSpecifier: dependency.version) }
+					.collect()
+					.map { $0.sort() }
+					.flatMap(.Concat) { nodes -> SignalProducer<DependencyNode, CarthageError> in
 						if nodes.isEmpty {
 							return SignalProducer(error: CarthageError.RequiredVersionNotFound(dependency.project, dependency.version))
 						} else {
@@ -105,9 +181,9 @@ public struct Resolver {
 						}
 					}
 			}
-			|> collect
-			|> observeOn(scheduler)
-			|> flatMap(.Concat) { nodeProducers in permutations(nodeProducers) }
+			.collect()
+			.observeOn(scheduler)
+			.flatMap(.Concat) { nodeProducers in permutations(nodeProducers) }
 	}
 
 	/// Sends all possible permutations of `inputGraph` oriented around the
@@ -117,21 +193,21 @@ public struct Resolver {
 	/// possible permutation of the dependencies for the given node (chosen from
 	/// among the verisons that actually exist for each).
 	private func graphPermutationsForDependenciesOfNode(node: DependencyNode, basedOnGraph inputGraph: DependencyGraph) -> SignalProducer<DependencyGraph, CarthageError> {
-		let scheduler = QueueScheduler(name: "org.carthage.CarthageKit.Resolver.graphPermutationsForDependenciesOfNode")
+		let scheduler = QueueScheduler(queue: dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), name: "org.carthage.CarthageKit.Resolver.graphPermutationsForDependenciesOfNode")
 
 		return cartfileForDependency(node.dependencyVersion)
-			|> startOn(scheduler)
-			|> concat(SignalProducer(value: Cartfile(dependencies: [])))
-			|> take(1)
-			|> observeOn(scheduler)
-			|> flatMap(.Merge) { self.nodePermutationsForCartfile($0) }
-			|> flatMap(.Concat) { dependencyNodes in
+			.startOn(scheduler)
+			.concat(SignalProducer(value: Cartfile(dependencies: [])))
+			.take(1)
+			.observeOn(scheduler)
+			.flatMap(.Merge) { self.nodePermutationsForCartfile($0) }
+			.flatMap(.Concat) { dependencyNodes in
 				return self.graphPermutationsForEachNode(dependencyNodes, dependencyOf: node, basedOnGraph: inputGraph)
-					|> promoteErrors(CarthageError.self)
+					.promoteErrors(CarthageError.self)
 			}
 			// Pass through resolution errors only if we never got
 			// a valid graph.
-			|> dematerializeErrorsIfEmpty
+			.dematerializeErrorsIfEmpty()
 	}
 
 	/// Recursively permutes each element in `nodes` and all dependencies
@@ -151,42 +227,42 @@ public struct Resolver {
 
 					switch graph.addNode(node, dependencyOf: dependencyOf) {
 					case let .Success(newNode):
-						newNodes.append(newNode.value)
+						newNodes.append(newNode)
 
 					case let .Failure(error):
-						sendError(observer, error.value)
+						observer.sendFailed(error)
 						return
 					}
 				}
 
-				sendNext(observer, (graph, newNodes))
-				sendCompleted(observer)
+				observer.sendNext((graph, newNodes))
+				observer.sendCompleted()
 			}
-			|> flatMap(.Concat) { graph, nodes -> SignalProducer<DependencyGraph, CarthageError> in
+			.flatMap(.Concat) { graph, nodes -> SignalProducer<DependencyGraph, CarthageError> in
 				return SignalProducer(values: nodes)
 					// Each producer represents all evaluations of one subtree.
-					|> map { node in self.graphPermutationsForDependenciesOfNode(node, basedOnGraph: graph) }
-					|> collect
-					|> observeOn(QueueScheduler(name: "org.carthage.CarthageKit.Resolver.graphPermutationsForEachNode"))
-					|> flatMap(.Concat) { graphProducers in permutations(graphProducers) }
-					|> flatMap(.Concat) { graphs -> SignalProducer<Event<DependencyGraph, CarthageError>, CarthageError> in
+					.map { node in self.graphPermutationsForDependenciesOfNode(node, basedOnGraph: graph) }
+					.collect()
+					.observeOn(QueueScheduler(queue: dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), name: "org.carthage.CarthageKit.Resolver.graphPermutationsForEachNode"))
+					.flatMap(.Concat) { graphProducers in permutations(graphProducers) }
+					.flatMap(.Concat) { graphs -> SignalProducer<Event<DependencyGraph, CarthageError>, CarthageError> in
 						let mergedGraphs = SignalProducer(values: graphs)
-							|> scan(Result<DependencyGraph, CarthageError>.success(inputGraph)) { result, nextGraph in
+							.scan(Result<DependencyGraph, CarthageError>.Success(inputGraph)) { result, nextGraph in
 								return result.flatMap { previousGraph in mergeGraphs(previousGraph, nextGraph) }
 							}
-							|> tryMap { $0 }
+							.attemptMap { $0 }
 
 						return SignalProducer(value: inputGraph)
-							|> concat(mergedGraphs)
-							|> takeLast(1)
-							|> materialize
-							|> promoteErrors(CarthageError.self)
+							.concat(mergedGraphs)
+							.takeLast(1)
+							.materialize()
+							.promoteErrors(CarthageError.self)
 					}
 					// Pass through resolution errors only if we never got
 					// a valid graph.
-					|> dematerializeErrorsIfEmpty
+					.dematerializeErrorsIfEmpty()
 			}
-			|> materialize
+			.materialize()
 	}
 }
 
@@ -210,7 +286,7 @@ private struct DependencyGraph: Equatable {
 
 	/// Returns all of the graph nodes, in the order that they should be built.
 	var orderedNodes: [DependencyNode] {
-		return sorted(allNodes) { lhs, rhs in
+		return allNodes.sort { lhs, rhs in
 			let lhsDependencies = self.edges[lhs]
 			let rhsDependencies = self.edges[rhs]
 
@@ -258,7 +334,9 @@ private struct DependencyGraph: Equatable {
 	/// Returns the node as actually inserted into the graph (which may be
 	/// different from the node passed in), or an error if this addition would
 	/// make the graph inconsistent.
-	mutating func addNode(var node: DependencyNode, dependencyOf: DependencyNode?) -> Result<DependencyNode, CarthageError> {
+	mutating func addNode(node: DependencyNode, dependencyOf: DependencyNode?) -> Result<DependencyNode, CarthageError> {
+		var node = node
+
 		if let index = allNodes.indexOf(node) {
 			let existingNode = allNodes[index]
 
@@ -267,10 +345,10 @@ private struct DependencyGraph: Equatable {
 					node = existingNode
 					node.versionSpecifier = newSpecifier
 				} else {
-					return .failure(CarthageError.RequiredVersionNotFound(node.project, newSpecifier))
+					return .Failure(CarthageError.RequiredVersionNotFound(node.project, newSpecifier))
 				}
 			} else {
-				return .failure(CarthageError.IncompatibleRequirements(node.project, existingNode.versionSpecifier, node.versionSpecifier))
+				return .Failure(CarthageError.IncompatibleRequirements(node.project, existingNode.versionSpecifier, node.versionSpecifier))
 			}
 		} else {
 			allNodes.insert(node)
@@ -289,7 +367,8 @@ private struct DependencyGraph: Equatable {
 
 			// Add a nested dependency to the list of its ancestor.
 			let edgesCopy = edges
-			for (ancestor, var itsDependencies) in edgesCopy {
+			for (ancestor, itsDependencies) in edgesCopy {
+				var itsDependencies = itsDependencies
 				if itsDependencies.contains(dependencyOf) {
 					itsDependencies.insert(node)
 					edges[ancestor] = itsDependencies
@@ -299,7 +378,18 @@ private struct DependencyGraph: Equatable {
 			roots.insert(node)
 		}
 
-		return .success(node)
+		return .Success(node)
+	}
+
+	/// Whether the given node is included or not in the nested dependencies of
+	/// the given dependencies.
+	func dependencies(dependencies: [String], containsNestedDependencyOfNode node: DependencyNode) -> Bool {
+		return edges.lazy
+			.filter { edge, nodeSet in
+				return dependencies.contains(edge.project.name) && nodeSet.contains(node)
+			}
+			.map { _ in true }
+			.first ?? false
 	}
 }
 
@@ -333,7 +423,7 @@ private func ==(lhs: DependencyGraph, rhs: DependencyGraph) -> Bool {
 	return true
 }
 
-extension DependencyGraph: Printable {
+extension DependencyGraph: CustomStringConvertible {
 	private var description: String {
 		var str = "Roots:"
 
@@ -358,18 +448,20 @@ extension DependencyGraph: Printable {
 ///
 /// Returns the new graph, or an error if the graphs specify inconsistent
 /// versions for one or more dependencies.
-private func mergeGraphs(lhs: DependencyGraph, rhs: DependencyGraph) -> Result<DependencyGraph, CarthageError> {
-	var result: Result<DependencyGraph, CarthageError> = .success(lhs)
+private func mergeGraphs(lhs: DependencyGraph, _ rhs: DependencyGraph) -> Result<DependencyGraph, CarthageError> {
+	var result: Result<DependencyGraph, CarthageError> = .Success(lhs)
 
 	for root in rhs.roots {
-		result = result.flatMap { (var graph) in
+		result = result.flatMap { graph in
+			var graph = graph
 			return graph.addNode(root, dependencyOf: nil).map { _ in graph }
 		}
 	}
 
 	for (node, dependencies) in rhs.edges {
 		for dependency in dependencies {
-			result = result.flatMap { (var graph) in
+			result = result.flatMap { graph in
+				var graph = graph
 				return graph.addNode(dependency, dependencyOf: node).map { _ in graph }
 			}
 		}
@@ -394,6 +486,9 @@ private class DependencyNode: Comparable {
 	/// This specifier may change as the graph is added to, and the requirements
 	/// become more stringent.
 	var versionSpecifier: VersionSpecifier
+
+	/// The dependencies of this node.
+	var dependencies: Set<DependencyNode> = []
 
 	/// A Dependency equivalent to this node.
 	var dependencyVersion: Dependency<PinnedVersion> {
@@ -427,7 +522,7 @@ extension DependencyNode: Hashable {
 	}
 }
 
-extension DependencyNode: Printable {
+extension DependencyNode: CustomStringConvertible {
 	private var description: String {
 		return "\(project) @ \(proposedVersion) (restricted to \(versionSpecifier))"
 	}

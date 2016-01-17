@@ -17,18 +17,18 @@ class ProjectSpec: QuickSpec {
 		let directoryURL = NSBundle(forClass: self.dynamicType).URLForResource("CartfilePrivateOnly", withExtension: nil)!
 
 		it("should load a combined Cartfile when only a Cartfile.private is present") {
-			let result = Project(directoryURL: directoryURL).loadCombinedCartfile() |> single
+			let result = Project(directoryURL: directoryURL).loadCombinedCartfile().single()
 			expect(result).notTo(beNil())
 			expect(result?.value).notTo(beNil())
 
 			let dependencies = result?.value?.dependencies
-			expect(dependencies?.count).to(equal(1))
-			expect(dependencies?.first?.project.name).to(equal("Carthage"))
+			expect(dependencies?.count) == 1
+			expect(dependencies?.first?.project.name) == "Carthage"
 		}
 
         it("should detect duplicate dependencies across Cartfile and Cartfile.private") {
             let directoryURL = NSBundle(forClass: self.dynamicType).URLForResource("DuplicateDependencies", withExtension: nil)!
-            let result = Project(directoryURL: directoryURL).loadCombinedCartfile() |> single
+            let result = Project(directoryURL: directoryURL).loadCombinedCartfile().single()
 			expect(result).notTo(beNil())
 
 			let resultError = result?.error
@@ -50,7 +50,7 @@ class ProjectSpec: QuickSpec {
 				makeDependency("5", "5", bothLocations),
 			])
 
-			expect(resultError).to(equal(expectedError))
+			expect(resultError) == expectedError
         }
 	}
 }

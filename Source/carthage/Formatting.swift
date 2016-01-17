@@ -13,12 +13,14 @@ import Result
 import PrettyColors
 
 /// Wraps a string with terminal colors and formatting or passes it through, depending on `colorful`.
-private func wrap(colorful: Bool)(wrap: Color.Wrap)(string: String) -> String {
-	return colorful ? wrap.wrap(string) : string
+private func wrap(colorful: Bool, wrap: Color.Wrap) -> String -> String {
+	return { string in
+		return colorful ? wrap.wrap(string) : string
+	}
 }
 
 /// Argument for whether to color and format terminal output.
-public enum ColorArgument: String, ArgumentType, Printable {
+public enum ColorArgument: String, ArgumentType, CustomStringConvertible {
 	case Auto = "auto"
 	case Never = "never"
 	case Always = "always"
@@ -42,7 +44,7 @@ public enum ColorArgument: String, ArgumentType, Printable {
 	public static let name = "color"
 	
 	public static func fromString(string: String) -> ColorArgument? {
-		return self(rawValue: string.lowercaseString)
+		return self.init(rawValue: string.lowercaseString)
 	}
 	
 }
@@ -66,11 +68,11 @@ public struct ColorOptions: OptionsType {
 		
 		init(_ colorful: Bool) {
 			self.colorful = colorful
-			bulletin      = wrap(colorful)(wrap: Color.Wrap(foreground: .Blue, style: .Bold))
+			bulletin      = wrap(colorful, wrap: Color.Wrap(foreground: .Blue, style: .Bold))
 			bullets       = bulletin(string: "***") + " "
-			URL           = wrap(colorful)(wrap: Color.Wrap(styles: .Underlined))
-			projectName   = wrap(colorful)(wrap: Color.Wrap(styles: .Bold))
-			path          = wrap(colorful)(wrap: Color.Wrap(foreground: .Yellow))
+			URL           = wrap(colorful, wrap: Color.Wrap(styles: .Underlined))
+			projectName   = wrap(colorful, wrap: Color.Wrap(styles: .Bold))
+			path          = wrap(colorful, wrap: Color.Wrap(foreground: .Yellow))
 		}
 
 		/// Wraps a string in bullets, one space of padding, and formatting.
@@ -80,12 +82,12 @@ public struct ColorOptions: OptionsType {
 
 		/// Wraps a string in quotation marks and formatting.
 		func quote(string: String, quotationMark: String = "\"") -> String {
-			return wrap(colorful)(wrap: Color.Wrap(foreground: .Green))(string: quotationMark + string + quotationMark)
+			return wrap(colorful, wrap: Color.Wrap(foreground: .Green))(quotationMark + string + quotationMark)
 		}
 	}
 	
 	public static func create(argument: ColorArgument) -> ColorOptions {
-		return self(argument: argument, formatting: Formatting(argument.isColorful))
+		return self.init(argument: argument, formatting: Formatting(argument.isColorful))
 	}
 	
 	public static func evaluate(m: CommandMode) -> Result<ColorOptions, CommandantError<CarthageError>> {

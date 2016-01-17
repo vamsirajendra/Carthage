@@ -11,10 +11,10 @@ import Result
 import ReactiveCocoa
 
 /// An abstract type representing a way to specify versions.
-public protocol VersionType: Scannable, Equatable {}
+public protocol VersionType: Equatable {}
 
 /// A semantic version.
-public struct SemanticVersion: Comparable {
+public struct SemanticVersion: VersionType, Comparable {
 	/// The major version.
 	///
 	/// Increments to this component represent incompatible API changes.
@@ -57,14 +57,15 @@ public struct SemanticVersion: Comparable {
 		// that.
 		scanner.scanUpToCharactersFromSet(versionCharacterSet, intoString: nil)
 
-		return self.fromScanner(scanner).flatMap { (var version) in
+		return self.fromScanner(scanner).flatMap { version in
 			if scanner.atEnd {
+				var version = version
 				version.pinnedVersion = pinnedVersion
-				return .success(version)
+				return .Success(version)
 			} else {
 				// Disallow versions like "1.0a5", because we only support
 				// SemVer right now.
-				return .failure(CarthageError.ParseError(description: "syntax of version \"\(version)\" is unsupported"))
+				return .Failure(CarthageError.ParseError(description: "syntax of version \"\(version)\" is unsupported"))
 			}
 		}
 	}
@@ -76,34 +77,32 @@ extension SemanticVersion: Scannable {
 	static public func fromScanner(scanner: NSScanner) -> Result<SemanticVersion, CarthageError> {
 		var version: NSString? = nil
 		if !scanner.scanCharactersFromSet(versionCharacterSet, intoString: &version) || version == nil {
-			return .failure(CarthageError.ParseError(description: "expected version in line: \(scanner.currentLine)"))
+			return .Failure(CarthageError.ParseError(description: "expected version in line: \(scanner.currentLine)"))
 		}
 
-		let components = split(version! as String, allowEmptySlices: false) { $0 == "." }
+		let components = (version! as String).characters.split(allowEmptySlices: false) { $0 == "." }.map(String.init)
 		if components.count == 0 {
-			return .failure(CarthageError.ParseError(description: "expected version in line: \(scanner.currentLine)"))
+			return .Failure(CarthageError.ParseError(description: "expected version in line: \(scanner.currentLine)"))
 		}
 
-		let major = components[0].toInt()
+		let major = Int(components[0])
 		if major == nil {
-			return .failure(CarthageError.ParseError(description: "expected major version number in \"\(version!)\""))
+			return .Failure(CarthageError.ParseError(description: "expected major version number in \"\(version!)\""))
 		}
 
-		let minor = (components.count > 1 ? components[1].toInt() : nil)
+		let minor = (components.count > 1 ? Int(components[1]) : nil)
 		if minor == nil {
-			return .failure(CarthageError.ParseError(description: "expected minor version number in \"\(version!)\""))
+			return .Failure(CarthageError.ParseError(description: "expected minor version number in \"\(version!)\""))
 		}
 
-		let patch = (components.count > 2 ? components[2].toInt() : 0)
+		let patch = (components.count > 2 ? Int(components[2]) : 0)
 
-		return .success(self(major: major!, minor: minor ?? 0, patch: patch ?? 0))
+		return .Success(self.init(major: major!, minor: minor ?? 0, patch: patch ?? 0))
 	}
 }
 
-extension SemanticVersion: VersionType {}
-
 public func <(lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
-	return lexicographicalCompare(lhs.components, rhs.components)
+	return lhs.components.lexicographicalCompare(rhs.components)
 }
 
 public func ==(lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
@@ -112,18 +111,18 @@ public func ==(lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
 
 extension SemanticVersion: Hashable {
 	public var hashValue: Int {
-		return reduce(components, 0) { $0 ^ $1.hashValue }
+		return components.reduce(0) { $0 ^ $1.hashValue }
 	}
 }
 
-extension SemanticVersion: Printable {
+extension SemanticVersion: CustomStringConvertible {
 	public var description: String {
-		return ".".join(components.map { $0.description })
+		return components.map { $0.description }.joinWithSeparator(".")
 	}
 }
 
 /// An immutable version that a project can be pinned to.
-public struct PinnedVersion: Equatable {
+public struct PinnedVersion: VersionType {
 	/// The commit SHA, or name of the tag, to pin to.
 	public let commitish: String
 
@@ -139,25 +138,23 @@ public func ==(lhs: PinnedVersion, rhs: PinnedVersion) -> Bool {
 extension PinnedVersion: Scannable {
 	public static func fromScanner(scanner: NSScanner) -> Result<PinnedVersion, CarthageError> {
 		if !scanner.scanString("\"", intoString: nil) {
-			return .failure(CarthageError.ParseError(description: "expected pinned version in line: \(scanner.currentLine)"))
+			return .Failure(CarthageError.ParseError(description: "expected pinned version in line: \(scanner.currentLine)"))
 		}
 
 		var commitish: NSString? = nil
 		if !scanner.scanUpToString("\"", intoString: &commitish) || commitish == nil {
-			return .failure(CarthageError.ParseError(description: "empty pinned version in line: \(scanner.currentLine)"))
+			return .Failure(CarthageError.ParseError(description: "empty pinned version in line: \(scanner.currentLine)"))
 		}
 
 		if !scanner.scanString("\"", intoString: nil) {
-			return .failure(CarthageError.ParseError(description: "unterminated pinned version in line: \(scanner.currentLine)"))
+			return .Failure(CarthageError.ParseError(description: "unterminated pinned version in line: \(scanner.currentLine)"))
 		}
 
-		return .success(self(commitish! as String))
+		return .Success(self.init(commitish! as String))
 	}
 }
 
-extension PinnedVersion: VersionType {}
-
-extension PinnedVersion: Printable {
+extension PinnedVersion: CustomStringConvertible {
 	public var description: String {
 		return "\"\(commitish)\""
 	}
@@ -165,7 +162,7 @@ extension PinnedVersion: Printable {
 
 /// Describes which versions are acceptable for satisfying a dependency
 /// requirement.
-public enum VersionSpecifier: Equatable {
+public enum VersionSpecifier: VersionType {
 	case Any
 	case AtLeast(SemanticVersion)
 	case CompatibleWith(SemanticVersion)
@@ -213,7 +210,7 @@ public enum VersionSpecifier: Equatable {
 
 public func ==(lhs: VersionSpecifier, rhs: VersionSpecifier) -> Bool {
 	switch (lhs, rhs) {
-	case let (.Any, .Any):
+	case (.Any, .Any):
 		return true
 
 	case let (.Exactly(left), .Exactly(right)):
@@ -245,23 +242,21 @@ extension VersionSpecifier: Scannable {
 		} else if scanner.scanString("\"", intoString: nil) {
 			var refName: NSString? = nil
 			if !scanner.scanUpToString("\"", intoString: &refName) || refName == nil {
-				return .failure(CarthageError.ParseError(description: "expected Git reference name in line: \(scanner.currentLine)"))
+				return .Failure(CarthageError.ParseError(description: "expected Git reference name in line: \(scanner.currentLine)"))
 			}
 
 			if !scanner.scanString("\"", intoString: nil) {
-				return .failure(CarthageError.ParseError(description: "unterminated Git reference name in line: \(scanner.currentLine)"))
+				return .Failure(CarthageError.ParseError(description: "unterminated Git reference name in line: \(scanner.currentLine)"))
 			}
 
-			return .success(.GitReference(refName! as String))
+			return .Success(.GitReference(refName! as String))
 		} else {
-			return .success(Any)
+			return .Success(Any)
 		}
 	}
 }
 
-extension VersionSpecifier: VersionType {}
-
-extension VersionSpecifier: Printable {
+extension VersionSpecifier: CustomStringConvertible {
 	public var description: String {
 		switch self {
 		case .Any:
@@ -282,7 +277,7 @@ extension VersionSpecifier: Printable {
 	}
 }
 
-private func intersection(#atLeast: SemanticVersion, #compatibleWith: SemanticVersion) -> VersionSpecifier? {
+private func intersection(atLeast atLeast: SemanticVersion, compatibleWith: SemanticVersion) -> VersionSpecifier? {
 	if atLeast.major > compatibleWith.major {
 		return nil
 	} else if atLeast.major < compatibleWith.major {
@@ -292,7 +287,7 @@ private func intersection(#atLeast: SemanticVersion, #compatibleWith: SemanticVe
 	}
 }
 
-private func intersection(#atLeast: SemanticVersion, #exactly: SemanticVersion) -> VersionSpecifier? {
+private func intersection(atLeast atLeast: SemanticVersion, exactly: SemanticVersion) -> VersionSpecifier? {
 	if atLeast > exactly {
 		return nil
 	}
@@ -300,7 +295,7 @@ private func intersection(#atLeast: SemanticVersion, #exactly: SemanticVersion) 
 	return .Exactly(exactly)
 }
 
-private func intersection(#compatibleWith: SemanticVersion, #exactly: SemanticVersion) -> VersionSpecifier? {
+private func intersection(compatibleWith compatibleWith: SemanticVersion, exactly: SemanticVersion) -> VersionSpecifier? {
 	if exactly.major != compatibleWith.major || compatibleWith > exactly {
 		return nil
 	}
@@ -313,7 +308,7 @@ private func intersection(#compatibleWith: SemanticVersion, #exactly: SemanticVe
 ///
 /// In other words, any version that satisfies the returned specifier will
 /// satisfy _both_ of the given specifiers.
-public func intersection(lhs: VersionSpecifier, rhs: VersionSpecifier) -> VersionSpecifier? {
+public func intersection(lhs: VersionSpecifier, _ rhs: VersionSpecifier) -> VersionSpecifier? {
 	switch (lhs, rhs) {
 	// Unfortunately, patterns with a wildcard _ are not considered exhaustive,
 	// so do the same thing manually.
@@ -390,7 +385,7 @@ public func intersection(lhs: VersionSpecifier, rhs: VersionSpecifier) -> Versio
 /// In other words, any version that satisfies the returned specifier will
 /// satisfy _all_ of the given specifiers.
 public func intersection<S: SequenceType where S.Generator.Element == VersionSpecifier>(specs: S) -> VersionSpecifier? {
-	return reduce(specs, nil) { (left: VersionSpecifier?, right: VersionSpecifier) -> VersionSpecifier? in
+	return specs.reduce(nil) { (left: VersionSpecifier?, right: VersionSpecifier) -> VersionSpecifier? in
 		if let left = left {
 			return intersection(left, right)
 		} else {
